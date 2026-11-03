@@ -1,0 +1,216 @@
+import pandas as pd
+import win32com.client
+import datetime
+import re
+import os
+import unicodedata
+
+# --- 1. FUNCIONES DE LIMPIEZA Y CÁLCULO ---
+def limpiar_texto(texto):
+    """Quita tildes, convierte a minúsculas, elimina espacios dobles y ceros a la izquierda en días."""
+    if pd.isna(texto): 
+        return ""
+    texto = str(texto).lower() # Todo a minúsculas para facilitar búsqueda
+    # Quitar tildes y acentos
+    texto_sin_tildes = ''.join((c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn'))
+    # Quitar espacios múltiples y dejar solo uno
+    texto_limpio = " ".join(texto_sin_tildes.split())
+    
+    # Quita el '0' a la izquierda en números del 01 al 09 de forma invisible
+    texto_limpio = re.sub(r'\b0([1-9])\b', r'\1', texto_limpio)
+    
+    return texto_limpio
+
+def calcular_variables(f_inicio, f_final):
+    """Calcula y devuelve el diccionario de variables basado en las fechas dadas."""
+    meses = {
+        1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+        7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
+    }
+    return {
+        "MES_NOMBRE": meses[f_inicio.month],
+        "NUMERO_SEMANA": f_inicio.isocalendar()[1],
+        "DIA_FECHA_INICIO": str(f_inicio.day), # .day evita el cero a la izquierda
+        "DIA_FECHA_FINAL": str(f_final.day),   # .day evita el cero a la izquierda
+        "AÑO": f_inicio.year,
+        "AÑO_ULTIMOSDOS": f_inicio.strftime("%y")
+    }
+
+def construir_patron_regex(plantilla, valores):
+    """Sustituye variables si existen, y prepara el texto para búsqueda flexible."""
+    if pd.isna(plantilla): return ".*"
+    
+    plantilla = str(plantilla)
+    for clave, valor in valores.items():
+        plantilla = plantilla.replace("{{" + clave + "}}", str(valor))
+    
+    # 1. Usamos una palabra de seguridad ya en minúsculas
+    plantilla = plantilla.replace("{{TEXTO}}", "comodintexto")
+    
+    # 2. Limpiamos (esto no afectará nuestra palabra de seguridad)
+    plantilla_limpia = limpiar_texto(plantilla)
+    
+    patron_escapado = re.escape(plantilla_limpia)
+    
+    # 3. Reemplazamos buscando en minúsculas
+    patron_final = patron_escapado.replace("comodintexto", ".*")
+    patron_final = patron_final.replace(r"\ ", r"\s+").replace(" ", r"\s+")
+    
+    return patron_final
+
+def obtener_email_remitente(msg):
+    try:
+        if msg.SenderEmailType == "EX":
+            return msg.Sender.GetExchangeUser().PrimarySmtpAddress.lower()
+    except Exception:
+        pass
+    return msg.SenderEmailAddress.lower()
+
+# --- 2. SOLICITAR FECHAS INICIALES ---
+def obtener_fechas():
+    while True:
+        try:
+            fecha_in_str = input("Ingrese la fecha de inicio (dd.mm.aaaa): ")
+            fecha_fin_str = input("Ingrese la fecha final (dd.mm.aaaa): ")
+            return (datetime.datetime.strptime(fecha_in_str, "%d.%m.%Y"), 
+                    datetime.datetime.strptime(fecha_fin_str, "%d.%m.%Y"))
+        except ValueError:
+            print("Formato incorrecto. Intente de nuevo (dd.mm.aaaa).")
+
+fecha_inicio_base, fecha_final_base = obtener_fechas()
+print("\nIniciando proceso...")
+
+# --- 3. LECTURA DE EXCEL Y OUTLOOK ---
+ruta_excel = r"D:\Users\HMendizabalC\Python\Mexico\correos\homonimos.xlsx" 
+
+try:
+    df = pd.read_excel(ruta_excel)
+except Exception as e:
+    print(f"Error al leer Excel: {e}")
+    exit()
+
+# Agregamos columna de estado si no existe
+if 'Estado Descarga' not in df.columns:
+    df['Estado Descarga'] = 'No descargado'
+
+outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+correo_gmb = "correo_compartido@tuempresa.com" # <--- CAMBIAR POR EL GMB REAL
+
+try:
+    recipient = outlook.CreateRecipient(correo_gmb)
+    recipient.Resolve()
+    if recipient.Resolved:
+        inbox = outlook.GetSharedDefaultFolder(recipient, 6) 
+    else:
+        print(f"No se pudo resolver el GMB: {correo_gmb}")
+        exit()
+except Exception as e:
+    print(f"Error Outlook: {e}")
+    exit()
+
+mensajes = inbox.Items
+mensajes.Sort("[ReceivedTime]", True)
+mensajes_a_revisar = list(mensajes)[:1000] 
+
+# --- 4. FUNCIÓN PRINCIPAL DE REVISIÓN DE UN CORREO ---
+def procesar_cliente(row_data, f_inicio, f_final):
+    """Busca en los correos basándose en las fechas calculadas dadas. Retorna True si descargó."""
+    email_contacto = str(row_data['email']).strip().lower()
+    asunto_estructura = row_data['Subject']
+    ruta_guardado = str(row_data['Ruta']).strip()
+    nota_profunda = str(row_data.get('Nota', '')).strip().lower()
+    
+    # Calculamos variables para esta iteración
+    valores = calcular_variables(f_inicio, f_final)
+    patron_asunto = construir_patron_regex(asunto_estructura, valores)
+    
+    # Preparar datos para "búsqueda profunda"
+    dia_inicio_limpio = str(int(valores['DIA_FECHA_INICIO']))
+    mes_limpio = limpiar_texto(valores['MES_NOMBRE'])
+    mes_abrev = mes_limpio[:3] # EXTRAE LAS PRIMERAS 3 LETRAS DEL MES (ej. "oct")
+    
+    descargado_algo = False
+    
+    for msg in mensajes_a_revisar:
+        try:
+            if msg.Class == 43:
+                sender_email = obtener_email_remitente(msg)
+                
+                # 1. Coincide email?
+                if email_contacto in sender_email:
+                    asunto_limpio = limpiar_texto(msg.Subject)
+                    
+                    # 2. Coincide el Asunto?
+                    if re.search(patron_asunto, asunto_limpio, re.IGNORECASE):
+                        
+                        cumple_profundidad = True
+                        
+                        # 3. Validar búsqueda profunda (si aplica)
+                        if "body" in nota_profunda:
+                            cuerpo_limpio = limpiar_texto(msg.Body)
+                            # Se permite mes completo o abreviado
+                            fechas_en_cuerpo = (dia_inicio_limpio in cuerpo_limpio and 
+                                                (mes_limpio in cuerpo_limpio or mes_abrev in cuerpo_limpio))
+                            
+                            if "adjunto" in nota_profunda:
+                                nombres_adjuntos = " ".join([limpiar_texto(a.FileName) for a in msg.Attachments])
+                                # Se permite mes completo o abreviado
+                                fechas_en_adjunto = (dia_inicio_limpio in nombres_adjuntos and 
+                                                     (mes_limpio in nombres_adjuntos or mes_abrev in nombres_adjuntos))
+                                cumple_profundidad = (fechas_en_cuerpo or fechas_en_adjunto)
+                            else:
+                                cumple_profundidad = fechas_en_cuerpo
+                                
+                        # 4. Si pasó todos los filtros, procedemos a descargar
+                        if cumple_profundidad and msg.Attachments.Count > 0:
+                            for att in msg.Attachments:
+                                nombre_archivo = att.FileName
+                                if nombre_archivo.lower().endswith(('.xlsx', '.xlsm', '.pdf')):
+                                    if not os.path.exists(ruta_guardado):
+                                        os.makedirs(ruta_guardado)
+                                    ruta_archivo = os.path.join(ruta_guardado, nombre_archivo)
+                                    att.SaveAsFile(ruta_archivo)
+                                    print(f"Éxito: {email_contacto} -> {nombre_archivo}")
+                                    descargado_algo = True
+                                    
+            if descargado_algo:
+                return True # Rompemos el ciclo porque ya se descargó
+        except Exception as e:
+            pass
+            
+    return descargado_algo
+
+# --- 5. ITERACIÓN SOBRE EL EXCEL ---
+for index, row in df.iterrows():
+    if pd.isna(row.get('email')): 
+        continue
+        
+    print(f"\nBuscando: {row['email']}")
+    
+    # INTENTO 1: Buscar con las fechas base originales
+    exito = procesar_cliente(row, fecha_inicio_base, fecha_final_base)
+    
+    # INTENTO 2: Si no se encontró y existe un "Ajuste fecha", recalcular e intentar de nuevo
+    if not exito and pd.notna(row.get('Ajuste fecha')):
+        try:
+            dias_ajuste = int(row['Ajuste fecha'])
+            print(f"  -> No encontrado. Aplicando ajuste de {dias_ajuste} días...")
+            
+            # Recalculamos las fechas
+            nueva_fecha_inicio = fecha_inicio_base + datetime.timedelta(days=dias_ajuste)
+            nueva_fecha_final = fecha_final_base + datetime.timedelta(days=dias_ajuste)
+            
+            # Volvemos a buscar con el ajuste
+            exito = procesar_cliente(row, nueva_fecha_inicio, nueva_fecha_final)
+        except ValueError:
+            print("  -> Error: El valor en la columna 'Ajuste fecha' no es numérico.")
+            
+    # Registrar el resultado final
+    if exito:
+        df.at[index, 'Estado Descarga'] = 'Descargado'
+
+# --- 6. EXPORTAR ---
+directorio_base = os.path.dirname(ruta_excel)
+ruta_salida = os.path.join(directorio_base, "resultado_" + os.path.basename(ruta_excel))
+df.to_excel(ruta_salida, index=False)
+print(f"\nProceso finalizado. Archivo de control guardado en:\n{ruta_salida}")
