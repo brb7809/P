@@ -1,0 +1,778 @@
+import pdfplumber
+import pandas as pd
+import re
+from datetime import datetime
+import glob
+import os
+
+# ==========================================
+# CONFIGURACIÓN GENERAL
+# ==========================================
+ARCHIVO_EXCEL_SALIDA = 'reporte_cines_CONSOLIDADO.xlsx'
+AÑO_ACTUAL = 2026 
+
+MESES_ESPANOL = {
+    'Ene': 1, 'Jan': 1, 'Feb': 2, 'Mar': 3, 'Abr': 4, 'Apr': 4, 
+    'May': 5, 'Jun': 6, 'Jul': 7, 'Ago': 8, 'Aug': 8, 
+    'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dic': 12, 'Dec': 12
+}
+
+MESES_COMPLETOS = {
+    'enero': 1, 'january': 1, 'febrero': 2, 'february': 2,
+    'marzo': 3, 'march': 3, 'abril': 4, 'april': 4,
+    'mayo': 5, 'may': 5, 'junio': 6, 'june': 6,
+    'julio': 7, 'july': 7, 'agosto': 8, 'august': 8,
+    'septiembre': 9, 'september': 9, 'octubre': 10, 'october': 10,
+    'noviembre': 11, 'november': 11, 'diciembre': 12, 'december': 12
+}
+
+ORDEN_COLUMNAS = [
+    'E/D', 'CODIGO DE CINE', 'NUMERO DE SALA', 'CINE', 'FECHA', 
+    'CODIGO DE PELICULA', 'PELICULA', '0', 'ASISTENTES', 'INGRESO'
+]
+
+def limpiar_titulo_pelicula(titulo_bruto):
+    titulo = str(titulo_bruto).upper().replace('"', '').replace("'", "")
+    titulo = re.sub(r'^\s*\d{2}:\d{2}:\d{2}\s*', '', titulo)
+    
+    if "ESIDENT" in titulo or "NOCHE" in titulo or "RESIDENT EVIL" in titulo:
+        return "RESIDENT EVIL: NOCHE CERO"
+    if "MAN:" in titulo or "N NUE" in titulo or "SPIDER" in titulo:
+        return "SPIDER-MAN: UN NUEVO DIA"
+    
+    match_tags = re.search(r'\s+(TRAD|T\.A\.|2D|2\.|DOB|\.OB|SUB)', titulo)
+    if match_tags:
+        titulo = titulo[:match_tags.start()]
+        
+    titulo = re.sub(r'\s*\([^)]*\)', '', titulo)
+    return titulo.strip()
+
+# ==========================================
+# MÓDULOS DE EXTRACCIÓN PDF
+# ==========================================
+def procesar_formato_1(archivo_pdf):
+    print(f"  -> Extrayendo Formato 1 (PDF Multifecha)...")
+    datos = []
+    try:
+        with pdfplumber.open(archivo_pdf) as pdf:
+            for pagina in pdf.pages:
+                texto = pagina.extract_text(layout=True)
+                if not texto: continue
+                lineas = texto.split('\n')
+                
+                # 1. Extracción robusta de fechas (Restaurada)
+                dias, meses = [], []
+                for linea in lineas[:15]:
+                    if not dias:
+                        matches = re.findall(r'(\d{1,2})-', linea)
+                        if len(matches) >= 7: dias = matches[:7]
+                    if not meses:
+                        matches = re.findall(r'\b(Ene|Jan|Feb|Mar|Abr|Apr|May|Jun|Jul|Ago|Aug|Sep|Oct|Nov|Dic|Dec)\b', linea, re.IGNORECASE)
+                        if len(matches) >= 7: meses = matches[:7]
+                
+                fechas = []
+                if dias and meses:
+                    for dia, mes_texto in zip(dias, meses):
+                        mes_num = MESES_ESPANOL.get(mes_texto.capitalize(), 1)
+                        fecha_obj = datetime(AÑO_ACTUAL, mes_num, int(dia))
+                        fechas.append(fecha_obj.strftime('%m/%d/%Y'))
+                else:
+                    fechas = [f"Dia {i+1}" for i in range(7)]
+
+                buscando_asistentes = False
+                cine_actual = sala_actual = pelicula_actual = ""
+                ingresos_actuales = []
+
+                for linea in lineas:
+                    linea = linea.strip()
+                    
+                    if buscando_asistentes:
+                        # Extraer solo números de asistentes
+                        asistentes_str = re.findall(r'(?<!\$)\b\d+(?:,\d+)?\b(?!%)', linea)
+                        if len(asistentes_str) >= 7:
+                            asistentes_actuales = [int(x.replace(',', '')) for x in asistentes_str[:7]]
+                            for i in range(7):
+                                datos.append({
+                                    'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': sala_actual,
+                                    'CINE': cine_actual, 'FECHA': fechas[i] if i < len(fechas) else f"Dia {i+1}",
+                                    'CODIGO DE PELICULA': '', 'PELICULA': limpiar_titulo_pelicula(pelicula_actual), 
+                                    '0': '', 'ASISTENTES': asistentes_actuales[i], 'INGRESO': ingresos_actuales[i]
+                                })
+                        buscando_asistentes = False
+                        continue
+
+                    if linea.count('$') >= 7 and linea[0].isalpha() and not linea.upper().startswith('TOTAL'):
+                        pos_dolar = linea.find('$')
+                        if pos_dolar == -1: continue
+                        
+                        lado_izquierdo = linea[:pos_dolar].strip()
+                        lado_derecho = linea[pos_dolar:].strip()
+                        
+                        ingresos_str = re.findall(r'\$[0-9,]+(?:\.\d{2})?', lado_derecho)
+                        if len(ingresos_str) < 7: continue
+                        ingresos_actuales = [float(x.replace('$', '').replace(',', '')) for x in ingresos_str[:7]]
+                        
+                        # --- NUEVO CORTE INTELIGENTE DE TEXTO ---
+                        # Quitar distribuidora y semana al final (Ej. "SONY 6")
+                        match_end = re.search(r'\s+([A-Z]{2,})\s+(\d{1,2})$', lado_izquierdo)
+                        if match_end:
+                            lado_izquierdo = lado_izquierdo[:match_end.start()].strip()
+                            
+                        # Usar el nombre de la película como punto de corte
+                        if "RESIDENT" in lado_izquierdo.upper() or "NOCHE CERO" in lado_izquierdo.upper():
+                            idx = lado_izquierdo.upper().find("RESIDENT")
+                            if idx == -1: idx = lado_izquierdo.upper().find("NOCHE CERO")
+                            cine_actual = lado_izquierdo[:idx].strip()
+                            pelicula_actual = "RESIDENT EVIL: NOCHE CERO"
+                        elif "SPIDER" in lado_izquierdo.upper() or "NUEVO DIA" in lado_izquierdo.upper() or "N NUE" in lado_izquierdo.upper():
+                            idx = lado_izquierdo.upper().find("SPIDER")
+                            if idx == -1: idx = lado_izquierdo.upper().find("N NUE")
+                            cine_actual = lado_izquierdo[:idx].strip()
+                            pelicula_actual = "SPIDER-MAN: UN NUEVO DIA"
+                        else:
+                            partes = lado_izquierdo.split()
+                            if len(partes) > 2:
+                                cine_actual = " ".join(partes[:2])
+                                pelicula_actual = " ".join(partes[2:])
+                            else:
+                                cine_actual = lado_izquierdo
+                                pelicula_actual = "Desconocida"
+                                
+                        # Extraer sala si el cine termina en número (Ej. "Matehuala 5")
+                        sala_actual = ""
+                        match_sala = re.search(r'\b(\d+)$', cine_actual)
+                        if match_sala:
+                            sala_actual = match_sala.group(1)
+                            cine_actual = cine_actual[:match_sala.start()].strip()
+                        # ----------------------------------------
+                        
+                        buscando_asistentes = True
+                        
+        print(f"     ✅ Formato 1: Se extrajeron {len(datos)} registros.")
+    except Exception as e:
+        print(f"     ❌ Error en Formato 1: {e}")
+    return datos
+
+def procesar_formato_2(archivo_pdf):
+    print(f"  -> Extrayendo Formato 2 (PDF Por Fila)...")
+    datos = []
+    try:
+        with pdfplumber.open(archivo_pdf) as pdf:
+            for pagina in pdf.pages:
+                texto = pagina.extract_text()
+                if not texto: continue
+                for linea in texto.split('\n'):
+                    if "TOTAL" in linea.upper(): continue
+                    match_fecha = re.search(r'(\d{2})/(\d{2})/(\d{4})', linea)
+                    if not match_fecha: continue
+                    dia, mes, anio = match_fecha.groups()
+                    fecha_us = f"{mes}/{dia}/{anio}"
+                    antes_fecha = linea[:match_fecha.start()].strip()
+                    despues_fecha = linea[match_fecha.end():].strip()
+                    match_sala = re.search(r'Sala\s*(\d+)', antes_fecha, re.IGNORECASE)
+                    if match_sala:
+                        sala = match_sala.group(1) 
+                        cine_distribuidora = antes_fecha[:match_sala.start()].strip()
+                    else:
+                        sala, cine_distribuidora = "", antes_fecha
+                    partes_cine = cine_distribuidora.split(maxsplit=1)
+                    cine = partes_cine[1] if len(partes_cine) > 1 else cine_distribuidora
+                    match_dinero = re.search(r'(\d+)\s+\$([\d,]+(?:\.\d{2})?)', despues_fecha)
+                    if match_dinero:
+                        datos.append({
+                            'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': sala,
+                            'CINE': cine, 'FECHA': fecha_us, 'CODIGO DE PELICULA': '',
+                            'PELICULA': limpiar_titulo_pelicula(despues_fecha[:match_dinero.start()]), 
+                            '0': '', 'ASISTENTES': int(match_dinero.group(1)),
+                            'INGRESO': float(match_dinero.group(2).replace(',', ''))
+                        })
+        print(f"     ✅ Formato 2: Se extrajeron {len(datos)} registros.")
+    except Exception as e:
+        print(f"     ❌ Error en Formato 2: {e}")
+    return datos
+
+def procesar_formato_5_reporte_boletos(archivo_pdf):
+    print(f"  -> Extrayendo Formato 5 (Reporte Boletos Vendidos)...")
+    datos = []
+    try:
+        with pdfplumber.open(archivo_pdf) as pdf:
+            cine_actual = "Desconocido"
+            pelicula_actual = "Desconocida"
+            fecha_actual = ""
+            for pagina in pdf.pages:
+                texto = pagina.extract_text()
+                if not texto: continue
+                for linea in texto.split('\n'):
+                    linea_limpia = linea.strip()
+                    if "Recinto:" in linea_limpia:
+                        cine_actual = linea_limpia.split("Recinto:")[1].strip()
+                    if "Evento:" in linea_limpia:
+                        pelicula_bruta = linea_limpia.split("Evento:")[1].strip()
+                        if "-" in pelicula_bruta:
+                            pelicula_bruta = pelicula_bruta.split("-", 1)[1].strip()
+                        pelicula_actual = limpiar_titulo_pelicula(pelicula_bruta)
+
+                    match_fecha = re.search(r'(\d{2})/(\d{2})/(\d{4})\s+\d{2}:\d{2}', linea_limpia)
+                    if match_fecha:
+                        dia, mes, anio = match_fecha.groups()
+                        fecha_actual = f"{mes}/{dia}/{anio}" 
+
+                    if "GRAN TOTAL" in linea_limpia.upper():
+                        continue
+                    elif "TOTAL:" in linea_limpia.upper() or "TOTAL" in linea_limpia.upper():
+                        match_dinero = re.search(r'(\d+)\s+\$\s*([\d,]+(?:\.\d{2})?)\s*$', linea_limpia)
+                        if match_dinero and fecha_actual:
+                            asistentes = int(match_dinero.group(1))
+                            ingreso = float(match_dinero.group(2).replace(',', ''))
+                            datos.append({
+                                'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': '', 
+                                'CINE': cine_actual, 'FECHA': fecha_actual, 'CODIGO DE PELICULA': '',
+                                'PELICULA': pelicula_actual, 
+                                '0': '', 'ASISTENTES': asistentes, 'INGRESO': ingreso
+                            })
+        print(f"     ✅ Formato 5: Se extrajeron {len(datos)} registros de totales.")
+    except Exception as e:
+        print(f"     ❌ Error en Formato 5: {e}")
+    return datos
+
+def procesar_formato_7_cinemarey(archivo_pdf):
+    print(f"  -> Extrayendo Formato 7 (CinemaRey - Distribuidores por película)...")
+    datos = []
+    try:
+        with pdfplumber.open(archivo_pdf) as pdf:
+            cine_actual = "CinemaRey" 
+            pelicula_actual = "Desconocida"
+            
+            for pagina in pdf.pages:
+                texto = pagina.extract_text()
+                if not texto: continue
+                
+                for linea in texto.split('\n'):
+                    linea_limpia = linea.strip()
+                    
+                    if "CINEMAREY" in linea_limpia.upper():
+                        match_cine = re.search(r'(CinemaRey)', linea_limpia, re.IGNORECASE)
+                        if match_cine:
+                            cine_actual = match_cine.group(1)
+
+                    if " - " in linea_limpia and ("Releasing" in linea_limpia or "Pictures" in linea_limpia):
+                        pelicula_bruta = linea_limpia.split(" - ")[-1].strip()
+                        pelicula_actual = limpiar_titulo_pelicula(pelicula_bruta)
+
+                    match_fecha = re.search(r'([a-záéíóú]+),\s*(\d{1,2})\s*de\s*([a-záéíóú]+)\s*de\s*(\d{4})', linea_limpia.lower())
+                    if match_fecha:
+                        dia_semana, dia, mes_str, anio = match_fecha.groups()
+                        mes = MESES_COMPLETOS.get(mes_str, 1)
+                        fecha_us = f"{mes:02d}/{int(dia):02d}/{anio}"
+
+                        parte_numerica = linea_limpia[match_fecha.end():].strip()
+                        numeros = re.findall(r'[\d,]+\.\d{2}|\d+', parte_numerica)
+                        
+                        if len(numeros) >= 6:
+                            admisiones = int(numeros[2].replace(',', ''))
+                            ingreso_bruto = float(numeros[5].replace(',', ''))
+
+                            datos.append({
+                                'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': '', 
+                                'CINE': cine_actual, 'FECHA': fecha_us, 'CODIGO DE PELICULA': '',
+                                'PELICULA': pelicula_actual, 
+                                '0': '', 'ASISTENTES': admisiones, 'INGRESO': ingreso_bruto
+                            })
+        print(f"     ✅ Formato 7: Se extrajeron {len(datos)} registros de admisiones y total bruto.")
+    except Exception as e:
+        print(f"     ❌ Error en Formato 7: {e}")
+    return datos
+
+# ==========================================
+# MÓDULOS DE EXTRACCIÓN EXCEL
+# ==========================================
+def procesar_formato_3_excel(df):
+    print(f"  -> Extrayendo Formato 3 (Excel Estándar)...")
+    datos = []
+    textos_recientes = [] 
+    
+    for index, row in df.iterrows():
+        valores = []
+        for x in row.values:
+            if pd.isna(x): continue
+            if hasattr(x, 'strftime'):
+                valores.append(x.strftime('%m/%d/%Y'))
+            else:
+                texto_celda = str(x).strip()
+                match_iso = re.match(r'^(\d{4})-(\d{2})-(\d{2})', texto_celda)
+                if match_iso:
+                    anio, mes, dia = match_iso.groups()
+                    valores.append(f"{mes}/{dia}/{anio}")
+                elif texto_celda != '':
+                    valores.append(texto_celda)
+                    
+        if not valores: continue
+            
+        match_fecha = None
+        idx_fecha = -1
+        for i, v in enumerate(valores):
+            match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', v)
+            if match:
+                match_fecha = match
+                idx_fecha = i
+                break
+                
+        if match_fecha:
+            p1, p2, anio = match_fecha.groups()
+            if int(p1) > 12:
+                fecha_us = f"{int(p2):02d}/{int(p1):02d}/{anio}"
+            else:
+                fecha_us = f"{int(p1):02d}/{int(p2):02d}/{anio}"
+            
+            if len(textos_recientes) >= 2:
+                cine_actual = textos_recientes[-2]      
+                pelicula_actual = textos_recientes[-1]  
+            elif len(textos_recientes) == 1:
+                cine_actual = textos_recientes[0]
+                pelicula_actual = "Desconocida"
+            else:
+                cine_actual = "Desconocido"
+                pelicula_actual = "Desconocida"
+            
+            try:
+                asistentes = int(float(valores[idx_fecha + 1]))
+                ingreso_texto = str(valores[idx_fecha + 3]).replace(',', '').replace('$', '').strip()
+                ingreso = float(ingreso_texto) if ingreso_texto else 0.0
+                
+                datos.append({
+                    'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': '', 
+                    'CINE': cine_actual, 'FECHA': fecha_us, 'CODIGO DE PELICULA': '',
+                    'PELICULA': limpiar_titulo_pelicula(pelicula_actual), 
+                    '0': '', 'ASISTENTES': asistentes, 'INGRESO': ingreso
+                })
+            except Exception as e:
+                pass
+        else:
+            full_text = " ".join(valores).strip()
+            full_text = re.sub(r'\s+', ' ', full_text) 
+            if not full_text: continue
+            full_text_upper = full_text.upper()
+            if full_text_upper.startswith(("TOTAL", "REPORTE", "PROVEEDOR", "EXHIBIDORA", "FECHA", "DIA")):
+                continue
+            if full_text_upper == "CINE" or full_text_upper.startswith("CINE DIA FECHA") or "CINE DIA" in full_text_upper:
+                continue
+            if not re.sub(r'[\d\s.,$%]', '', full_text):
+                continue
+            textos_recientes.append(full_text)
+
+    print(f"     ✅ Formato 3: Se extrajeron {len(datos)} registros.")
+    return datos
+
+def procesar_formato_4_papeleta(df):
+    print(f"  -> Extrayendo Formato 4 (Papeleta con Macros)...")
+    datos = []
+    cine_actual = "Desconocido"
+    pelicula_actual = "Desconocida"
+    
+    for index, row in df.iterrows():
+        valores_crudos = [str(x).strip() for x in row.values if pd.notna(x) and str(x).strip() != '']
+        if not valores_crudos: continue
+            
+        texto_unido = " ".join(valores_crudos).upper()
+        
+        if "CINEMAS:" in texto_unido:
+            for i, val in enumerate(valores_crudos):
+                if val.upper() == "CINEMAS:" and i + 1 < len(valores_crudos):
+                    cine_actual = valores_crudos[i+1]
+                    break
+        
+        if "PELICULA:" in texto_unido:
+            for i, val in enumerate(valores_crudos):
+                if val.upper() == "PELICULA:" and i + 1 < len(valores_crudos):
+                    pelicula_actual = valores_crudos[i+1]
+                    break
+
+        match_fecha = None
+        for val in valores_crudos:
+            if re.search(r'\d{1,2}/\d{1,2}/\d{4}', val) or re.search(r'\d{4}-\d{2}-\d{2}', val):
+                match_fecha = val
+                break
+                
+        if match_fecha and "SEMANA" not in texto_unido:
+            try:
+                if "-" in match_fecha:
+                    anio, mes, dia = match_fecha.split(' ')[0].split('-')
+                    fecha_us = f"{mes}/{dia}/{anio}"
+                else:
+                    partes = match_fecha.split('/')
+                    fecha_us = f"{partes[0].zfill(2)}/{partes[1].zfill(2)}/{partes[2]}"
+
+                ingreso_str = valores_crudos[-1].replace('$', '').replace(',', '').strip()
+                asistentes_str = valores_crudos[-2].replace(',', '').strip()
+                
+                ingreso = float(ingreso_str)
+                asistentes = int(float(asistentes_str))
+                
+                datos.append({
+                    'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': '', 
+                    'CINE': cine_actual, 'FECHA': fecha_us, 'CODIGO DE PELICULA': '',
+                    'PELICULA': limpiar_titulo_pelicula(pelicula_actual), 
+                    '0': '', 'ASISTENTES': asistentes, 'INGRESO': ingreso
+                })
+            except Exception as e:
+                pass
+
+    print(f"     ✅ Formato 4: Se extrajeron {len(datos)} registros.")
+    return datos
+
+def procesar_formato_6_cnx(df):
+    print(f"  -> Extrayendo Formato 6 (Reporte CINETIX)...")
+    datos = []
+    cine_actual = "Desconocido"
+    pelicula_actual = "Desconocida"
+    sala_actual = ""
+    
+    for index, row in df.iterrows():
+        valores = []
+        for x in row.values:
+            if pd.isna(x): continue
+            if hasattr(x, 'strftime'):
+                valores.append(x.strftime('%m/%d/%Y'))
+            else:
+                texto_celda = str(x).strip()
+                match_iso = re.match(r'^(\d{4})-(\d{2})-(\d{2})', texto_celda)
+                if match_iso:
+                    anio, mes, dia = match_iso.groups()
+                    valores.append(f"{mes}/{dia}/{anio}")
+                elif texto_celda != '':
+                    valores.append(texto_celda)
+                    
+        if not valores: continue
+        texto_unido = " ".join(valores).upper()
+        
+        for i, val in enumerate(valores):
+            val_upper = str(val).upper().strip()
+            if "CINETIX" in val_upper:
+                cine_actual = val
+            if val_upper == "PELICULA" or val_upper == "PELÍCULA":
+                if i + 1 < len(valores):
+                    pelicula_actual = valores[i+1]
+            elif "PELICULA" in val_upper and len(val_upper) > 9: 
+                pelicula_actual = val_upper.replace("PELICULA", "").replace(":", "").strip()
+            if val_upper == "SALA":
+                if i + 1 < len(valores):
+                    sala_actual = str(valores[i+1]).upper().replace("SALA", "").strip()
+            elif "SALA 1" in val_upper or "SALA 2" in val_upper:
+                sala_actual = val_upper.replace("SALA", "").replace(":", "").strip()
+
+        if "TOTAL" in texto_unido and "TAQUILLA" not in texto_unido:
+            continue
+
+        match_fecha = None
+        idx_fecha = -1
+        for i, val in enumerate(valores):
+            if re.search(r'\d{1,2}/\d{1,2}/\d{4}', str(val)):
+                match_fecha = str(val)
+                idx_fecha = i
+                break
+                
+        if match_fecha and idx_fecha + 2 < len(valores):
+            match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', match_fecha)
+            p1, p2, anio = match.groups()
+            
+            if int(p1) > 12: 
+                fecha_us = f"{int(p2):02d}/{int(p1):02d}/{anio}"
+            else: 
+                fecha_us = f"{int(p1):02d}/{int(p2):02d}/{anio}"
+            
+            try:
+                asistentes = int(float(valores[idx_fecha + 1]))
+                ingreso_str = str(valores[idx_fecha + 2]).replace('$', '').replace(',', '').strip()
+                ingreso = float(ingreso_str)
+                
+                datos.append({
+                    'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': sala_actual, 
+                    'CINE': cine_actual, 'FECHA': fecha_us, 'CODIGO DE PELICULA': '',
+                    'PELICULA': limpiar_titulo_pelicula(pelicula_actual), 
+                    '0': '', 'ASISTENTES': asistentes, 'INGRESO': ingreso
+                })
+            except Exception as e:
+                pass
+
+    print(f"     ✅ Formato 6: Se extrajeron {len(datos)} registros.")
+    return datos
+
+def procesar_formato_8_santalucia(df):
+    print(f"  -> Extrayendo Formato 8 (S.D.N Santa Lucia)...")
+    datos = []
+    cine_actual = "S.D.N CINE SANTA LUCIA"
+    pelicula_actual = "Desconocida"
+            
+    for index, row in df.iterrows():
+        valores_fila = []
+        for x in row.values:
+            if pd.isna(x):
+                valores_fila.append("")
+            elif hasattr(x, 'strftime'):
+                valores_fila.append(x.strftime('%m/%d/%Y')) 
+            else:
+                texto_celda = str(x).strip()
+                match_iso = re.match(r'^(\d{4})-(\d{2})-(\d{2})', texto_celda)
+                if match_iso:
+                    anio, mes, dia = match_iso.groups()
+                    valores_fila.append(f"{mes}/{dia}/{anio}")
+                else:
+                    valores_fila.append(texto_celda)
+
+        texto_unido = " ".join(valores_fila).upper()
+        texto_unido_limpio = re.sub(r'\s+', ' ', texto_unido)
+        
+        if "TITULO DE LA PELICULA" in texto_unido_limpio:
+            match_pelicula = re.search(r'"([^"]*)"', texto_unido_limpio)
+            if match_pelicula:
+                pelicula_actual = match_pelicula.group(1)
+            else:
+                partes = texto_unido_limpio.split(":")
+                if len(partes) > 1:
+                    pelicula_actual = partes[1].strip()
+
+        fecha_us = None
+        for v in valores_fila:
+            match_mmddyyyy = re.match(r'^(\d{2})/(\d{2})/(\d{4})$', v)
+            if match_mmddyyyy:
+                fecha_us = v
+                break
+                
+            match_texto = re.search(r'(\d{1,2})\s+DE\s+([A-Z]+)\s+DE\s+(\d{4})', v.upper())
+            if match_texto:
+                dia, mes_str, anio = match_texto.groups()
+                mes = MESES_COMPLETOS.get(mes_str.lower(), 1)
+                fecha_us = f"{mes:02d}/{int(dia):02d}/{anio}"
+                break
+        
+        if fecha_us:
+            try:
+                boletos_2d = 0
+                if len(valores_fila) > 1 and valores_fila[1].replace('.', '').isdigit():
+                    boletos_2d = int(float(valores_fila[1]))
+                    
+                boletos_3d = 0
+                if len(valores_fila) > 4 and valores_fila[4].replace('.', '').isdigit():
+                    boletos_3d = int(float(valores_fila[4]))
+                    
+                asistentes_totales = boletos_2d + boletos_3d
+                
+                ingreso = 0.0
+                for v in reversed(valores_fila):
+                    v_str = str(v).replace('$', '').replace(',', '').strip()
+                    if re.match(r'^-?\d+(?:\.\d+)?$', v_str):
+                        ingreso = float(v_str)
+                        break
+                
+                datos.append({
+                    'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': '', 
+                    'CINE': cine_actual, 'FECHA': fecha_us, 'CODIGO DE PELICULA': '',
+                    'PELICULA': limpiar_titulo_pelicula(pelicula_actual), 
+                    '0': '', 'ASISTENTES': asistentes_totales, 'INGRESO': ingreso
+                })
+            except Exception as e:
+                pass
+
+    print(f"     ✅ Formato 8: Se extrajeron {len(datos)} registros.")
+    return datos
+
+def procesar_formato_9_tabla_directa(df):
+    print(f"  -> Extrayendo Formato 9 (Tabla Columnas Pichucalco)...")
+    datos = []
+    
+    for index, row in df.iterrows():
+        valores = []
+        for x in row.values:
+            if pd.isna(x): 
+                valores.append("")
+            elif hasattr(x, 'strftime'):
+                valores.append(x.strftime('%m/%d/%Y'))
+            else:
+                texto_celda = str(x).strip()
+                match_iso = re.match(r'^(\d{4})-(\d{2})-(\d{2})', texto_celda)
+                if match_iso:
+                    anio, mes, dia = match_iso.groups()
+                    valores.append(f"{mes}/{dia}/{anio}")
+                else:
+                    valores.append(texto_celda)
+                    
+        texto_unido = " ".join(valores).upper()
+        if "TOTALES" in texto_unido:
+            continue
+            
+        idx_fecha = -1
+        match_fecha = None
+        for i, v in enumerate(valores):
+            if re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', v):
+                idx_fecha = i
+                match_fecha = v
+                break
+                
+        if match_fecha and idx_fecha >= 0:
+            try:
+                p1, p2, anio = match_fecha.split('/')
+                if int(p1) > 12:
+                    fecha_us = f"{int(p2):02d}/{int(p1):02d}/{anio}"
+                else:
+                    fecha_us = f"{int(p1):02d}/{int(p2):02d}/{anio}"
+                    
+                cine_actual = valores[idx_fecha - 1].strip() if idx_fecha > 0 else "Desconocido"
+                pelicula_actual = valores[idx_fecha + 1].strip()
+                
+                numeros = []
+                for val in valores[idx_fecha+2:]:
+                    val_limpio = val.replace('$', '').replace(',', '').strip()
+                    if re.match(r'^-?\d+(?:\.\d+)?$', val_limpio):
+                        numeros.append(float(val_limpio))
+                        
+                if len(numeros) >= 2:
+                    ingreso = float(numeros[0])
+                    asistentes = int(numeros[1])
+                else:
+                    continue
+                    
+                datos.append({
+                    'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': '', 
+                    'CINE': cine_actual, 'FECHA': fecha_us, 'CODIGO DE PELICULA': '',
+                    'PELICULA': limpiar_titulo_pelicula(pelicula_actual), 
+                    '0': '', 'ASISTENTES': asistentes, 'INGRESO': ingreso
+                })
+            except Exception as e:
+                pass
+
+    print(f"     ✅ Formato 9: Se extrajeron {len(datos)} registros.")
+    return datos
+
+def procesar_formato_10_sedena(df):
+    print(f"  -> Extrayendo Formato 10 (Excel Sedena / Columnas Directas)...")
+    datos = []
+    
+    for index, row in df.iterrows():
+        valores = [str(x).strip() if pd.notna(x) else "" for x in row.values]
+        
+        if len(valores) < 7:
+            continue
+            
+        fecha_str = valores[2]
+        
+        if hasattr(row.values[2], 'strftime'):
+            fecha_str = row.values[2].strftime('%m/%d/%Y')
+        else:
+            match_iso = re.match(r'^(\d{4})-(\d{2})-(\d{2})', fecha_str)
+            if match_iso:
+                anio, mes, dia = match_iso.groups()
+                fecha_str = f"{mes}/{dia}/{anio}"
+
+        match_fecha = re.search(r'(\d{1,2})/(\d{1,2})/(\d{4})', fecha_str)
+        if not match_fecha:
+            continue
+            
+        p1, p2, anio = match_fecha.groups()
+        if int(p1) > 12: 
+            fecha_us = f"{int(p2):02d}/{int(p1):02d}/{anio}"
+        else: 
+            fecha_us = f"{int(p1):02d}/{int(p2):02d}/{anio}"
+            
+        sala = valores[0].replace('$', '').strip()
+        cine = valores[1]
+        pelicula = valores[3]
+        
+        try:
+            asistentes = int(float(valores[5]))
+            ingreso_str = valores[6].replace('$', '').replace(',', '').strip()
+            ingreso = float(ingreso_str) if ingreso_str else 0.0
+            
+            datos.append({
+                'E/D': '', 'CODIGO DE CINE': '', 'NUMERO DE SALA': sala, 
+                'CINE': cine, 'FECHA': fecha_us, 'CODIGO DE PELICULA': '',
+                'PELICULA': limpiar_titulo_pelicula(pelicula), 
+                '0': '', 'ASISTENTES': asistentes, 'INGRESO': ingreso
+            })
+        except Exception as e:
+            pass
+
+    print(f"     ✅ Formato 10: Se extrajeron {len(datos)} registros.")
+    return datos
+
+# ==========================================
+# CEREBRO CLASIFICADOR Y EJECUCIÓN PRINCIPAL
+# ==========================================
+def main():
+    print("\n" + "="*60)
+    print(" INICIANDO ROBOT PROCESADOR DE CINES ")
+    print("="*60)
+    print(f"📍 Buscando en carpeta: {os.getcwd()}")
+    
+    archivos = glob.glob("*.pdf") + glob.glob("*.xlsx") + glob.glob("*.xls") + glob.glob("*.xlsm")
+    archivos = [a for a in archivos if a != ARCHIVO_EXCEL_SALIDA and not a.startswith('~$')]
+    
+    if not archivos:
+        print("\n❌ ALERTA: No se encontró NINGÚN archivo PDF o Excel válido en esta carpeta.\n")
+        return
+
+    print(f"📂 Archivos detectados a procesar: {len(archivos)}")
+    todos_los_datos = []
+    
+    for archivo in archivos:
+        print(f"\nAnalizando -> {archivo}")
+        
+        if archivo.endswith(('.xlsx', '.xls', '.xlsm')):
+            try:
+                df = pd.read_excel(archivo, header=None)
+                texto_inicial_excel = " ".join([str(x) for x in df.iloc[0:30].values.flatten() if pd.notna(x)]).upper()
+                texto_limpio_clasificador = re.sub(r'\s+', ' ', texto_inicial_excel)
+                
+                if "NUMERO DE SALA" in texto_inicial_excel and "ASISTENTES" in texto_inicial_excel and "CINE SEDENA" in texto_inicial_excel:
+                    datos = procesar_formato_10_sedena(df)
+                elif "S.D.N CINE SANTA LUCIA" in texto_limpio_clasificador or "ZUMPAGO" in texto_limpio_clasificador or "ZULAYCA" in texto_limpio_clasificador:
+                    datos = procesar_formato_8_santalucia(df)
+                elif "CINETIX" in texto_inicial_excel or "DANIELA TAMAYO SANDOVAL" in texto_inicial_excel:
+                    datos = procesar_formato_6_cnx(df)
+                elif "PAPELETA" in texto_inicial_excel or "CINEMAS:" in texto_inicial_excel:
+                    datos = procesar_formato_4_papeleta(df)
+                elif "CINE" in texto_inicial_excel and "FECHA" in texto_inicial_excel and "PELICULA" in texto_inicial_excel and "INGRESO" in texto_inicial_excel and "BOLETOS" in texto_inicial_excel:
+                    datos = procesar_formato_9_tabla_directa(df)
+                else:
+                    datos = procesar_formato_3_excel(df)
+                    
+                todos_los_datos.extend(datos)
+            except Exception as e:
+                print(f"  -> ❌ Error intentando abrir el Excel {archivo}: {e}")
+            continue
+            
+        try:
+            with pdfplumber.open(archivo) as pdf:
+                texto_inicial = pdf.pages[0].extract_text() or "" if len(pdf.pages) > 0 else ""
+            
+            texto_upper = texto_inicial.upper()
+            
+            if "DISTRIBUIDORES POR PELÍCULA Y TIPO DE ENTRADA" in texto_upper or "CINEMAREY" in texto_upper:
+                datos = procesar_formato_7_cinemarey(archivo)
+                todos_los_datos.extend(datos)
+            elif "REPORTE DE BOLETOS VENDIDOS IMPUESTOS" in texto_upper:
+                datos = procesar_formato_5_reporte_boletos(archivo)
+                todos_los_datos.extend(datos)
+            elif "TX_CINE" in texto_upper or "ID_SALA" in texto_upper:
+                datos = procesar_formato_2(archivo)
+                todos_los_datos.extend(datos)
+            elif "COMPLEJO" in texto_upper or "TITULO" in texto_upper or "CINEPLEX" in texto_upper:
+                datos = procesar_formato_1(archivo)
+                todos_los_datos.extend(datos)
+            else:
+                print(f"  -> ⚠️ No pude identificar el formato del PDF. Saltando archivo.")
+        except Exception as e:
+            print(f"  -> ❌ Error intentando abrir el PDF: {e}")
+
+    if todos_los_datos:
+        print(f"\n============================================================")
+        print(f"¡PROCESO EXITOSO! Consolidando {len(todos_los_datos)} registros en total...")
+        df_final = pd.DataFrame(todos_los_datos)
+        df_final = df_final[ORDEN_COLUMNAS]
+        df_final.to_excel(ARCHIVO_EXCEL_SALIDA, index=False)
+        print(f"Archivo guardado como: {ARCHIVO_EXCEL_SALIDA}")
+        print(f"============================================================")
+    else:
+        print("\n❌ Finalizado. No se pudo extraer ningún dato válido de los archivos leídos.")
+
+if __name__ == "__main__":
+    main()
